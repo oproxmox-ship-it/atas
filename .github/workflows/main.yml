@@ -1,0 +1,138 @@
+
+name: Windows RDP + Audio + Tailscale
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  secure-rdp:
+    runs-on: windows-2022
+    timeout-minutes: 350
+
+    steps:
+      # 1. Configure RDP securely
+      - name: Configure RDP
+        shell: powershell
+        run: |
+          Set-ItemProperty `
+            -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server' `
+            -Name 'fDenyTSConnections' -Value 0
+
+          Set-ItemProperty `
+            -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name 'UserAuthentication' -Value 1
+
+          Set-ItemProperty `
+            -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name 'SecurityLayer' -Value 1
+
+          # RDP firewall restricted to Tailscale IP range
+          New-NetFirewallRule `
+            -DisplayName 'RDP-Tailscale' `
+            -Direction Inbound `
+            -Protocol TCP `
+            -LocalPort 3389 `
+            -RemoteAddress '100.64.0.0/10' `
+            -Action Allow
+
+      # 2. Enable Windows Audio
+      - name: Enable RDP Audio
+        shell: powershell
+        run: |
+          Set-Service AudioEndpointBuilder -StartupType Automatic
+          Set-Service Audiosrv -StartupType Automatic
+
+          Start-Service AudioEndpointBuilder
+          Start-Service Audiosrv
+
+          $policy = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services'
+          New-Item -Path $policy -Force | Out-Null
+
+          # Allow audio playback redirection
+          Set-ItemProperty -Path $policy `
+            -Name 'fDisableAudioPlayback' `
+            -Type DWord -Value 0
+
+          # Allow microphone redirection
+          Set-ItemProperty -Path $policy `
+            -Name 'fDisableAudioCapture' `
+            -Type DWord -Value 0
+
+      # 3. Create RDP account
+      - name: Create RDP User
+        shell: powershell
+        run: |
+          $password = [Convert]::ToBase64String(
+            [Security.Cryptography.RandomNumberGenerator]::GetBytes(24)
+          ) + 'A1!'
+
+          $secure = ConvertTo-SecureString $password -AsPlainText -Force
+
+          New-LocalUser -Name 'RDP' `
+            -Password $secure `
+            -AccountNeverExpires
+
+          Add-LocalGroupMember -Group 'Administrators' -Member 'RDP'
+
+          "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
+
+      # 4. Install Tailscale
+      - name: Install Tailscale
+        shell: powershell
+        run: |
+          winget install --id Tailscale.Tailscale `
+            --exact --silent `
+            --accept-package-agreements `
+            --accept-source-agreements
+
+      # 5. Connect Tailscale
+      - name: Connect Tailscale
+        shell: powershell
+        env:
+          TS_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+        run: |
+          $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
+
+          if (-not (Test-Path $ts)) {
+            throw "Tailscale installation not found"
+          }
+
+          & $ts up --authkey=$env:TS_AUTHKEY `
+            --hostname="github-rdp-$env:GITHUB_RUN_ID"
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Tailscale connection failed"
+          }
+
+          $ip = $null
+          for ($i=0; $i -lt 20; $i++) {
+            $ip = (& $ts ip -4 | Select-Object -First 1).Trim()
+            if ($ip) { break }
+            Start-Sleep 3
+          }
+
+          if (-not $ip) { throw "No Tailscale IP" }
+
+          "TAILSCALE_IP=$ip" >> $env:GITHUB_ENV
+
+      # 6. Print connection information
+      - name: RDP Information
+        shell: powershell
+        run: |
+          Write-Host "=============================="
+          Write-Host "RDP ADDRESS: $env:TAILSCALE_IP"
+          Write-Host "USERNAME: RDP"
+          Write-Host "PASSWORD: $env:RDP_PASSWORD"
+          Write-Host "=============================="
+
+      # 7. Keep the runner alive
+      - name: Keep RDP Alive
+        shell: powershell
+        run: |
+          while ($true) {
+            Write-Host "RDP RUNNING - $(Get-Date)"
+            Start-Sleep -Seconds 60
+          }
